@@ -10,6 +10,17 @@ handler: the argon2 verification always runs and the slot is always settled
 
 No global lock serializes verifications; worker threads run argon2 fully in
 parallel and coordinate only through short SQLite write transactions.
+
+Time base
+---------
+The 60-second error window runs on the host monotonic clock (see
+``app/db.py``): wall-clock calibration (NTP steps, manual date changes)
+cannot lift a limit early or extend it, both web processes share the same
+time base, and windows keep elapsing across process/container restarts
+within one host boot. Admission and settlement are timestamped *after* the
+SQLite write lock is acquired, never while the request is still waiting for
+the lock. Wall-clock time (with the demo calibration offset applied) is
+used only for session expiry and display.
 """
 from __future__ import annotations
 
@@ -48,6 +59,17 @@ class LoginBody(BaseModel):
     delay: float = Field(default=0.0, ge=0.0, le=60.0)
 
 
+class ClockBody(BaseModel):
+    # Simulated wall-clock calibration offset, ±7 days.
+    offset_seconds: float = Field(ge=-7 * 24 * 3600, le=7 * 24 * 3600)
+
+
+class HoldLockBody(BaseModel):
+    # Keep well under the 30s SQLite busy_timeout so waiting writers block
+    # instead of erroring.
+    seconds: float = Field(ge=0.1, le=20.0)
+
+
 app = FastAPI(title="Guessing-budget login demo", version="1.0.0")
 
 
@@ -60,19 +82,28 @@ def _startup() -> None:
 
 @app.middleware("http")
 async def _add_process_header(request: Request, call_next):
-    started = time.time()
+    # Monotonic clock for durations: wall-clock calibration demos must not
+    # produce negative or absurd process times.
+    started = time.monotonic()
     try:
         response = await call_next(request)
     except Exception:
         raise
     response.headers["X-Served-By"] = settings.process_name
-    response.headers["X-Process-Time-ms"] = f"{(time.time() - started) * 1000:.1f}"
+    response.headers["X-Process-Time-ms"] = (
+        f"{(time.monotonic() - started) * 1000:.1f}"
+    )
     return response
 
 
 def _stats_payload() -> dict[str, Any]:
     return {
-        "now": time.time(),
+        # Service wall clock (demo offset applied) and the monotonic time
+        # base used for the error window, exposed so the page can show that
+        # calibration moves only the former.
+        "wall_now": db.wall_now(),
+        "mono_now": db.mono_now(),
+        "clock_offset_seconds": db.get_clock_offset(),
         "window_seconds": settings.error_window_seconds,
         "max_slots": settings.max_slots,
         "accounts": db.account_stats(),
@@ -134,7 +165,6 @@ def logout(request: Request) -> Response:
 @app.post("/api/login")
 def login(body: LoginBody) -> JSONResponse:
     delay = min(max(body.delay, 0.0), float(settings.max_delay_seconds))
-    now = time.time()
 
     conn = db.connect()
     try:
@@ -154,7 +184,9 @@ def login(body: LoginBody) -> JSONResponse:
     account_id = account["id"]
 
     # --- Atomic reservation: windowed errors + in-flight vs. the limit ---
-    slot_id = db.acquire_slot(account_id, now=now)
+    # The admission timestamp is taken inside, after the SQLite write lock
+    # is acquired — never here, before the (possibly long) lock wait.
+    slot_id = db.acquire_slot(account_id)
     if slot_id is None:
         # Full: reject immediately and do NOT hash the password.
         retry_after = math.ceil(db.next_retry_after(account_id))
@@ -185,7 +217,7 @@ def login(body: LoginBody) -> JSONResponse:
     # --- Settlement always happens, even if the client has disconnected ---
     if ok:
         token = new_session_token()
-        expires_at = time.time() + settings.session_ttl_seconds
+        expires_at = db.wall_now() + settings.session_ttl_seconds
         # Session insert + slot release + error reset commit together.
         settled = db.settle(
             slot_id,
@@ -234,4 +266,71 @@ def login(body: LoginBody) -> JSONResponse:
             "served_by": settings.process_name,
             "stats": _stats_payload(),
         },
+    )
+
+
+# --- Fault-injection demos ---------------------------------------------------
+# These endpoints let the web page demonstrate clock calibration (without
+# touching the host clock), SQLite lock waiting and restart semantics. They
+# change no security invariant: the error window always runs on the host
+# monotonic clock with post-lock timestamps.
+
+
+def _require_demo_api() -> None:
+    if not settings.demo_api_enabled:
+        raise HTTPException(status_code=404, detail="demo API disabled")
+
+
+@app.post("/api/demo/clock")
+def demo_clock(body: ClockBody) -> JSONResponse:
+    """Simulate an operator calibrating the server wall clock.
+
+    The offset is stored in the shared database, so both web processes see
+    the same calibrated wall clock. The error window is unaffected: it runs
+    on the monotonic clock.
+    """
+    _require_demo_api()
+    db.set_clock_offset(body.offset_seconds)
+    return JSONResponse(
+        {
+            "ok": True,
+            "clock_offset_seconds": db.get_clock_offset(),
+            "wall_now": db.wall_now(),
+            "mono_now": db.mono_now(),
+            "served_by": settings.process_name,
+        }
+    )
+
+
+@app.post("/api/demo/hold-lock")
+def demo_hold_lock(body: HoldLockBody) -> JSONResponse:
+    """Hold the SQLite write lock for a while (readers keep working)."""
+    _require_demo_api()
+    held = db.hold_write_lock(body.seconds)
+    return JSONResponse(
+        {
+            "ok": True,
+            "held_seconds": round(held, 3),
+            "served_by": settings.process_name,
+        }
+    )
+
+
+@app.post("/api/demo/restart")
+def demo_restart() -> JSONResponse:
+    """Simulate a process/container restart within the same host boot.
+
+    Runs exactly the startup reconciliation: stale in-flight slots are
+    reclaimed, completed error windows are kept and keep elapsing on the
+    monotonic clock — not cleared, not refilled.
+    """
+    _require_demo_api()
+    db.startup_cleanup()
+    return JSONResponse(
+        {
+            "ok": True,
+            "message": "已执行启动清理：在途占位清空，窗口内错误保留并继续流逝",
+            "served_by": settings.process_name,
+            "stats": _stats_payload(),
+        }
     )

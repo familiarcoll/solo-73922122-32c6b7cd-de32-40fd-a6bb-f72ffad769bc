@@ -87,6 +87,7 @@
   <p class="sub">
     每账号 60 秒窗口内「已完成错误 + 在途核验」合计上限 5；核验前原子占位，满额立即 429 且不做哈希。
     两个 Web 进程共享同一 SQLite（WAL），argon2 核验不持写锁、无全局串行锁；客户端断连后核验与结算仍会完成。
+    错误窗口以<b>宿主单调时钟</b>计时：校准服务器墙钟（前跳/后跳）不会提前解除也不会延长限制；准入与结算均以取得 SQLite 写锁后的时刻判定。
   </p>
 
   <div class="grid">
@@ -107,12 +108,13 @@
       </h2>
       <table>
         <thead><tr>
-          <th>账号</th><th>窗口内错误</th><th>在途核验</th><th>已用 / 上限</th><th>剩余名额</th>
+          <th>账号</th><th>窗口内错误</th><th>在途核验</th><th>已用 / 上限</th><th>剩余名额</th><th>窗口恢复倒计时</th>
         </tr></thead>
-        <tbody id="stats-body"><tr><td colspan="5" class="muted">加载中…</td></tr></tbody>
+        <tbody id="stats-body"><tr><td colspan="6" class="muted">加载中…</td></tr></tbody>
       </table>
       <p class="muted" style="margin-bottom:0">
-        窗口时长 <b id="window-label">60</b> 秒，错误按「核验完成时刻」计数；服务重启保留窗口内错误、清空在途占位。
+        窗口时长 <b id="window-label">60</b> 秒，按单调时钟实际经过时间计满即过期；错误按「核验完成时刻」计数；
+        服务重启保留窗口内错误（倒计时继续流逝，不清零也不重新计满）、清空在途占位。
       </p>
     </section>
 
@@ -165,6 +167,61 @@
       </div>
     </section>
 
+    <!-- 时间基准与故障演示 -->
+    <section class="card span-12">
+      <h2>时间基准 · 校时 / 锁等待 / 重启演示
+        <span class="tag">无需修改宿主时间</span>
+      </h2>
+      <table style="margin-bottom:12px">
+        <thead><tr>
+          <th>服务器墙钟（含校时偏移）</th><th>单调时钟（窗口计时基准）</th><th>当前校时偏移</th>
+        </tr></thead>
+        <tbody><tr>
+          <td id="srv-wall">—</td>
+          <td id="srv-mono">—</td>
+          <td id="srv-offset">—</td>
+        </tr></tbody>
+      </table>
+      <div class="row3">
+        <div>
+          <h2 style="font-size:13px">① 模拟校准服务器时间</h2>
+          <p class="muted" style="margin:4px 0">
+            偏移写入共享数据库，两个进程同时生效；仅影响墙钟（会话到期、显示），
+            错误窗口由单调时钟计时，<b>不解除、不延长</b>。
+          </p>
+          <div class="btn-row" style="margin-top:8px">
+            <button class="btn-ghost" id="btn-clock-fwd">墙钟前跳 1 小时</button>
+            <button class="btn-ghost" id="btn-clock-back">墙钟后跳 1 小时</button>
+            <button class="btn-primary" id="btn-clock-reset">恢复真实时间</button>
+          </div>
+        </div>
+        <div>
+          <h2 style="font-size:13px">② 模拟 SQLite 写锁等待</h2>
+          <p class="muted" style="margin:4px 0">
+            持有写锁期间：统计读取照常（WAL），登录的准入/结算会排队等待，
+            并以<b>取得锁后的时刻</b>判定——锁等待期间过期的错误会被正确放行。
+          </p>
+          <label>持锁时长（秒，≤20）</label>
+          <input id="hold-seconds" type="number" min="1" max="20" step="1" value="8" />
+          <div class="btn-row" style="margin-top:8px">
+            <button class="btn-primary" id="btn-hold-lock">持有写锁</button>
+          </div>
+        </div>
+        <div>
+          <h2 style="font-size:13px">③ 模拟进程 / 容器重启</h2>
+          <p class="muted" style="margin:4px 0">
+            执行与真实重启完全相同的启动清理：在途占位回收，窗口内错误保留且
+            倒计时继续流逝（同一宿主启动周期内，单调时钟不归零）。
+            也可用 <code>docker compose restart web1</code> 验证真实重启。
+          </p>
+          <div class="btn-row" style="margin-top:8px">
+            <button class="btn-primary" id="btn-restart">模拟进程重启</button>
+          </div>
+        </div>
+      </div>
+      <div class="result" id="demo-result" hidden></div>
+    </section>
+
     <!-- 演示说明 -->
     <section class="card span-12">
       <h2>建议演示步骤</h2>
@@ -172,10 +229,12 @@
         <ol>
           <li>对 <code>alice</code> 并发发起 <b>6</b> 个错误密码、延迟 4s：前 5 个原子占位进入在途，第 6 个立即收到 <b>429</b>（响应头 <code>Retry-After</code>），服务端不做 argon2 哈希。</li>
           <li>在途期间点「全部断开」或单行「断开」：浏览器侧请求已取消，但右侧名额表仍显示 5 个在途；约 4s 后核验在服务端跑完并结算，在途归零、窗口错误变 5 —— 断连没有提前归还名额。</li>
-          <li>5 个错误结算后再发起任何请求（即使密码正确）都会立即 429；等待 60 秒窗口滑过，名额自动恢复。</li>
+          <li>5 个错误结算后再发起任何请求（即使密码正确）都会立即 429；等待 60 秒窗口按实际经过时间滑过，名额自动恢复。</li>
           <li>在途未满时用正确密码发起一个长延迟请求，同时并发几个错误请求：成功完成会清除「当时已完成」的错误，而之后才完成的在途错误仍会计数。</li>
           <li>多次发起观察 <code>X-Served-By</code> 响应头 / 结果中的处理进程，请求在 <b>web1 / web2</b> 两个进程间轮询，名额状态全局一致。</li>
-          <li>重启容器（<code>docker compose restart</code>）：窗口内错误仍在，未完成占位被清空。</li>
+          <li><b>校时</b>：先制造 5 个错误触发限制，再点「墙钟前跳 1 小时」——限制不会解除；点「墙钟后跳 1 小时」——限制也不会延长；倒计时只随真实时间流逝。（对比：会话到期按墙钟计算，前跳 1 小时会使现有会话立即失效。）</li>
+          <li><b>锁等待</b>：制造 5 个错误后等倒计时接近 0，点「持有写锁」8 秒，期间发起登录会排队等待；锁释放时错误已过期，请求按取锁后的时刻判定被放行（401 而非 429），不会"过期仍拒绝"。</li>
+          <li><b>重启</b>：制造若干错误后点「模拟进程重启」（或 <code>docker compose restart web1</code>）：在途占位清空，窗口错误保留且倒计时接着流逝，不会清零或重新计满 60 秒。</li>
         </ol>
       </div>
     </section>
@@ -230,6 +289,8 @@ async function loadStats() {
     $("max-delay").textContent = 10;
     $("stats-body").innerHTML = data.accounts.map((a) => {
       const full = a.remaining_slots === 0;
+      const countdown = a.window_expires_in == null ? "—"
+        : `约 ${a.window_expires_in.toFixed(1)}s 后释放`;
       return `<tr>
         <td><b>${esc(a.username)}</b></td>
         <td>${a.window_errors}</td>
@@ -237,8 +298,16 @@ async function loadStats() {
         <td>${a.used_slots} / ${a.max_slots}
           <div class="bar"><i style="width:${(a.used_slots / a.max_slots) * 100}%"></i></div></td>
         <td><span class="pill ${full ? "err" : "ok"}">${a.remaining_slots} 个</span></td>
+        <td>${countdown}</td>
       </tr>`;
     }).join("");
+    // 时间基准读数：墙钟（含校时偏移） vs 单调时钟（窗口计时）
+    $("srv-wall").textContent = hhmmss(data.wall_now);
+    $("srv-mono").textContent = `${data.mono_now.toFixed(1)}s（宿主启动至今）`;
+    const off = data.clock_offset_seconds;
+    $("srv-offset").innerHTML = off === 0
+      ? '<span class="pill ok">0s（真实时间）</span>'
+      : `<span class="pill warn">${off > 0 ? "+" : ""}${off}s（模拟校时中）</span>`;
     $("poll-state").innerHTML = '<span class="dot live"></span>1s 自动刷新';
   } catch (e) {
     $("poll-state").innerHTML = '<span class="dot stale"></span>刷新失败，重试中';
@@ -388,6 +457,77 @@ $("btn-abort-all").onclick = () => {
 $("btn-clear").onclick = () => {
   $("burst-list").innerHTML =
     '<div class="req-row head"><span>#</span><span>状态</span><span>时间线 / 结果</span><span>耗时</span><span>处理进程</span></div>';
+};
+
+/* ---------- 时间基准与故障演示 ---------- */
+function showDemoResult(text) {
+  const out = $("demo-result");
+  out.hidden = false;
+  out.textContent = text;
+}
+
+async function postDemo(path, body) {
+  return api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+}
+
+async function setClock(offset, label) {
+  try {
+    const r = await postDemo("/api/demo/clock", { offset_seconds: offset });
+    showDemoResult(
+      `[${hhmmss(Date.now() / 1000)}] ${label}（进程 ${r.servedBy}）\n` +
+      JSON.stringify(r.body, null, 2) +
+      "\n\n观察上方名额表：窗口错误数与恢复倒计时不随墙钟跳变而改变。"
+    );
+  } catch (e) {
+    showDemoResult(`校时演示请求失败：${e.message}`);
+  }
+  loadStats();
+}
+$("btn-clock-fwd").onclick = () => setClock(3600, "墙钟前跳 1 小时");
+$("btn-clock-back").onclick = () => setClock(-3600, "墙钟后跳 1 小时");
+$("btn-clock-reset").onclick = () => setClock(0, "恢复真实时间");
+
+$("btn-hold-lock").onclick = async () => {
+  const btn = $("btn-hold-lock");
+  const seconds = Math.max(1, Math.min(20, parseFloat($("hold-seconds").value || "8")));
+  btn.disabled = true;
+  showDemoResult(`持有写锁 ${seconds}s 中… 期间统计读取照常、写入（登录准入/结算）排队等待。`);
+  const t0 = performance.now();
+  try {
+    const r = await postDemo("/api/demo/hold-lock", { seconds });
+    const ms = Math.round(performance.now() - t0);
+    showDemoResult(
+      `[${hhmmss(Date.now() / 1000)}] 已持有写锁 ${r.body.held_seconds}s 并释放` +
+      `（进程 ${r.servedBy}，请求耗时 ${ms}ms）\n` +
+      "锁等待期间提交的登录会以「取得写锁后的时刻」判定：等待期间过期的错误已被放行。"
+    );
+  } catch (e) {
+    showDemoResult(`持锁演示请求失败：${e.message}`);
+  } finally {
+    btn.disabled = false;
+    loadStats();
+  }
+};
+
+$("btn-restart").onclick = async () => {
+  const btn = $("btn-restart");
+  btn.disabled = true;
+  try {
+    const r = await postDemo("/api/demo/restart", {});
+    showDemoResult(
+      `[${hhmmss(Date.now() / 1000)}] 模拟重启完成（进程 ${r.servedBy}）：${r.body.message}\n` +
+      "观察名额表：窗口内错误仍在，恢复倒计时接着流逝（未清零、未重新计满）。"
+    );
+  } catch (e) {
+    showDemoResult(`重启演示请求失败：${e.message}`);
+  } finally {
+    btn.disabled = false;
+    loadStats();
+  }
 };
 
 loadMe();

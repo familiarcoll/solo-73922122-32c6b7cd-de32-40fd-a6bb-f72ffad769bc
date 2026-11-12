@@ -28,6 +28,10 @@ class Settings:
     max_delay_seconds: int = _env_int("MAX_DELAY_SECONDS", 10)
     session_ttl_seconds: int = _env_int("SESSION_TTL_SECONDS", 3600)
     process_name: str = os.environ.get("PROCESS_NAME", "login")
+    # Demo endpoints (clock calibration / lock holding / restart simulation).
+    demo_api_enabled: bool = os.environ.get(
+        "ENABLE_DEMO_API", "1"
+    ).strip().lower() not in ("0", "false", "no")
 
 
 settings = Settings()

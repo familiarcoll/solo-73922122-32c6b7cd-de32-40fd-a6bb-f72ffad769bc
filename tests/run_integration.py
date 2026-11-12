@@ -13,6 +13,15 @@ docker-compose deployment) and verifies:
   7. success clears completed errors; later in-flight failures still count
   8. restart keeps windowed errors and reclaims stale in-flight slots
   9. only password hashes are stored (no plaintext in the database)
+ 10. wall-clock calibration (±1h jumps) never lifts or extends the window
+ 11. admission is judged at the post-lock instant: errors that expire while
+     a request waits on the SQLite write lock are correctly admitted
+ 12. settlement is booked at the post-lock instant: an error settled after
+     a lock wait gets its full window from the real settlement time
+ 13. restart within one host boot keeps the window elapsing (no reset, no
+     refill) and expires errors at the original deadline
+ 14. demo endpoints: hold-lock, simulated restart, clock offset
+ 15. server logs contain no unhandled exceptions
 """
 from __future__ import annotations
 
@@ -110,6 +119,20 @@ def login(base: str, username: str, password: str, delay: float = 0.0,
         f"{base}/api/login",
         json={"username": username, "password": password, "delay": delay},
         timeout=timeout,
+    )
+
+
+def set_clock_offset(base: str, offset_seconds: float):
+    return httpx.post(
+        f"{base}/api/demo/clock",
+        json={"offset_seconds": offset_seconds},
+        timeout=10,
+    )
+
+
+def hold_lock(base: str, seconds: float):
+    return httpx.post(
+        f"{base}/api/demo/hold-lock", json={"seconds": seconds}, timeout=30
     )
 
 
@@ -361,8 +384,157 @@ def main() -> int:
         finally:
             conn.close()
 
-        # ---- 10. server logs contain no unhandled exceptions -------------
-        print("10. 服务端日志无未处理异常")
+        # ---- 10. wall-clock jumps do not move the error window ----------
+        print("10. 校时（墙钟前跳/后跳）不解除也不延长错误窗口")
+        reset_db()
+        # Five concurrent wrong passwords settle within ~1s of each other.
+        with ThreadPoolExecutor(max_workers=MAX_SLOTS) as pool:
+            futs = [pool.submit(login, BASE["web1"], "alice", "wrong")
+                    for _ in range(MAX_SLOTS)]
+            for f in futs:
+                f.result()
+        st = account_stat(BASE["web1"], "alice")
+        check(st["window_errors"] == MAX_SLOTS and st["remaining_slots"] == 0,
+              "预置 5 个错误后名额为 0")
+        check(login(BASE["web2"], "alice", "wrong").status_code == 429,
+              "满额时第 6 次尝试 429")
+        t_errors = time.monotonic()  # errors were settled just before this
+
+        r = set_clock_offset(BASE["web1"], 3600)
+        check(r.status_code == 200 and r.json()["clock_offset_seconds"] == 3600,
+              "模拟校时：墙钟前跳 1 小时")
+        # web1 的偏移缓存同步生效，可立即检查；跨进程可见性单独验证一次。
+        st = account_stat(BASE["web1"], "alice")
+        check(st["window_errors"] == MAX_SLOTS and st["remaining_slots"] == 0,
+              "墙钟前跳后窗口错误仍为 5（限制未被解除）")
+        check(login(BASE["web1"], "alice", "wrong").status_code == 429,
+              "墙钟前跳后第 6 次尝试仍 429")
+        time.sleep(0.8)  # let the other process's offset cache expire
+        s2 = stats(BASE["web2"])
+        check(abs(s2["wall_now"] - (time.time() + 3600)) < 10,
+              "另一进程同样看到 +1h 墙钟（偏移经共享库生效）")
+
+        check(set_clock_offset(BASE["web1"], -3600).status_code == 200,
+              "模拟校时：墙钟后跳 1 小时")
+        st = account_stat(BASE["web1"], "alice")
+        check(st["window_errors"] == MAX_SLOTS and st["remaining_slots"] == 0,
+              "墙钟后跳后窗口错误仍为 5（限制未被延长）")
+        check(login(BASE["web1"], "alice", "wrong").status_code == 429,
+              "墙钟后跳后第 6 次尝试仍 429")
+        # Even with the wall clock shifted backwards, the window expires on
+        # real elapsed time (monotonic), not one hour late.
+        deadline = t_errors + WINDOW + 6
+        recovered = False
+        while time.monotonic() < deadline:
+            if account_stat(BASE["web1"], "alice")["remaining_slots"] == MAX_SLOTS:
+                recovered = True
+                break
+            time.sleep(0.3)
+        check(recovered, "墙钟后跳状态下窗口仍按实际经过时间满期恢复")
+        set_clock_offset(BASE["web1"], 0)
+        time.sleep(0.8)
+        check(stats(BASE["web2"])["clock_offset_seconds"] == 0,
+              "恢复真实时间（偏移归零）")
+
+        # ---- 11. admission uses the post-lock instant --------------------
+        print("11. 准入以取得写锁后的时刻判定（锁等待期间过期的错误被放行）")
+        reset_db()
+        with ThreadPoolExecutor(max_workers=MAX_SLOTS) as pool:
+            futs = [pool.submit(login, BASE["web1"], "alice", "wrong")
+                    for _ in range(MAX_SLOTS)]
+            for f in futs:
+                f.result()
+        check(account_stat(BASE["web1"], "alice")["remaining_slots"] == 0,
+              "预置 5 个错误后满额")
+        # Hold the write lock until well past the window expiry.
+        holder = threading.Thread(target=hold_lock, args=(BASE["web2"], 7))
+        holder.start()
+        time.sleep(1.0)  # lock is held now; all errors expire during the hold
+        t0 = time.monotonic()
+        r = login(BASE["web1"], "alice", "wrong", timeout=30)
+        waited = time.monotonic() - t0
+        holder.join()
+        check(r.status_code == 401,
+              f"锁释放时错误已过期，请求被放行进入核验"
+              f"（401 而非 429，实际 {r.status_code}）")
+        check(waited > 4, f"请求确实排队等待了写锁（等待 {waited:.1f}s）")
+
+        # ---- 12. settlement is booked at the post-lock instant -----------
+        print("12. 结算以取得写锁后的时刻记录（窗口从实际结算时刻起算）")
+        reset_db()
+        holder = threading.Thread(target=hold_lock, args=(BASE["web2"], 4))
+        holder.start()
+        time.sleep(0.8)  # lock held; verification completes during the hold
+        r = login(BASE["web1"], "alice", "wrong", timeout=30)
+        holder.join()
+        t_released = time.monotonic()
+        check(r.status_code == 401, "错误密码返回 401")
+        check(account_stat(BASE["web1"], "alice")["window_errors"] == 1,
+              "错误已在锁释放后结算")
+        # With a pre-lock timestamp this error would expire one window after
+        # the *verification* finished (during the hold); it must instead
+        # expire one full window after the real settlement instant.
+        time.sleep(WINDOW - 1.5)
+        check(account_stat(BASE["web1"], "alice")["window_errors"] == 1,
+              "锁释放后近一个窗口时错误仍在（未按锁前时刻提前过期）")
+        deadline = t_released + WINDOW + 4
+        while time.monotonic() < deadline:
+            if account_stat(BASE["web1"], "alice")["window_errors"] == 0:
+                break
+            time.sleep(0.2)
+        check(account_stat(BASE["web1"], "alice")["window_errors"] == 0,
+              "自满期时刻起错误正常过期")
+
+        # ---- 13. restart keeps the window elapsing ------------------------
+        print("13. 重启后窗口继续流逝（不清零、不重新计满）")
+        reset_db()
+        check(login(BASE["web1"], "bob", "wrong").status_code == 401,
+              "制造 1 个已完成错误")
+        t_err = time.monotonic()
+        time.sleep(2.0)
+        run_startup_cleanup()  # simulated restart: same code as init_db
+        st = account_stat(BASE["web1"], "bob")
+        check(st["window_errors"] == 1, "重启后窗口内错误保留")
+        expires_in = st["window_expires_in"]
+        check(expires_in is not None and 0.5 <= expires_in <= WINDOW - 1.5,
+              f"恢复倒计时接着流逝而非重新计满（剩余 {expires_in}s）")
+        deadline = t_err + WINDOW + 4
+        while time.monotonic() < deadline:
+            if account_stat(BASE["web1"], "bob")["window_errors"] == 0:
+                break
+            time.sleep(0.2)
+        check(account_stat(BASE["web1"], "bob")["window_errors"] == 0,
+              "错误仍在原定的满窗口时刻过期")
+
+        # ---- 14. demo endpoints -------------------------------------------
+        print("14. 演示端点：持锁 / 模拟重启 / 校时")
+        reset_db()
+        r = hold_lock(BASE["web1"], 0.5)
+        check(r.status_code == 200 and r.json()["held_seconds"] >= 0.4,
+              "持锁端点返回实际持锁时长")
+        check(login(BASE["web1"], "bob", "wrong").status_code == 401,
+              "制造 1 个已完成错误")
+        pool = ThreadPoolExecutor(max_workers=1)
+        slow = pool.submit(lambda: login(BASE["web2"], "bob", "wrong",
+                                         delay=3.0, timeout=30))
+        time.sleep(0.8)
+        check(account_stat(BASE["web1"], "bob")["inflight"] == 1,
+              "模拟重启前存在 1 个在途占位")
+        r = httpx.post(f"{BASE['web1']}/api/demo/restart", timeout=10)
+        check(r.status_code == 200, "模拟重启端点 200")
+        st = account_stat(BASE["web1"], "bob")
+        check(st["inflight"] == 0 and st["window_errors"] == 1,
+              "模拟重启后在途清空、窗口错误保留")
+        code = slow.result().status_code
+        check(code == 401, f"被回收占位的慢请求优雅结算（{code}，非 500）")
+        pool.shutdown(wait=True)
+        st = account_stat(BASE["web1"], "bob")
+        check(st["inflight"] == 0 and st["window_errors"] == 1,
+              "慢请求结束后无残留占位、错误不重复计数")
+        reset_db()  # keep state clean for the log check
+
+        # ---- 15. server logs contain no unhandled exceptions -------------
+        print("15. 服务端日志无未处理异常")
         for name in PORTS:
             log_text = (DB_DIR / f"{name}.log").read_text(errors="replace")
             check("Traceback" not in log_text and "RuntimeError" not in log_text,
